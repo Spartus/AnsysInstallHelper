@@ -78,6 +78,7 @@ STATUS_MEDIA_PREPARED=0
 STATUS_INSTALL_CONFIGURED=0
 STATUS_INSTALL_DONE=0
 STATUS_LICENSE_DONE=0
+INSTALL_LOG_TAIL_PID=""
 
 RED=""
 GREEN=""
@@ -3245,7 +3246,7 @@ status_line() {
     local label="$1"
     local value="$2"
     local state="$3"
-    printf '  %-28s [%-22s] %s\n' "$label" "$value" "$state"
+    printf '  %-24.24s [%-20.20s] %s\n' "$label" "$value" "$state"
 }
 
 print_command() {
@@ -4433,22 +4434,67 @@ license_ini_path() {
     printf '%s/%s\n' "${INSTALL_DIR%/}" "$LICENSE_INI_RELATIVE"
 }
 
-archive_install_err() {
-    local install_err_path="${INSTALL_DIR%/}/install.err"
+install_err_path() {
+    printf '%s/install.err\n' "${INSTALL_DIR%/}"
+}
+
+install_log_path() {
+    printf '%s/install.log\n' "${INSTALL_DIR%/}"
+}
+
+archive_existing_installer_file() {
+    local file_path="$1"
     local archive_path=""
 
-    if [[ ! -e "$install_err_path" ]]; then
+    if [[ ! -e "$file_path" ]]; then
         return 0
     fi
 
-    archive_path="${install_err_path}.old.$(date '+%Y%m%d_%H%M%S')"
-    if run_cmd "Archiving previous install.err" mv "$install_err_path" "$archive_path"; then
-        info "Archived existing install.err to $(basename "$archive_path")."
+    archive_path="${file_path}.old.$(date '+%Y%m%d_%H%M%S')"
+    if run_cmd "Archiving $(basename "$file_path")" mv "$file_path" "$archive_path"; then
+        info "Archived existing $(basename "$file_path") to $(basename "$archive_path")."
     fi
 }
 
+archive_install_artifacts() {
+    archive_existing_installer_file "$(install_err_path)" || true
+    archive_existing_installer_file "$(install_log_path)" || true
+}
+
+start_install_log_tail() {
+    local log_path=""
+    log_path="$(install_log_path)"
+
+    INSTALL_LOG_TAIL_PID=""
+    if (( DRY_RUN )); then
+        return 0
+    fi
+
+    (
+        local waited=0
+        while (( waited < 7200 )); do
+            if [[ -f "$log_path" ]]; then
+                printf '\n[INFO] Streaming %s\n\n' "$log_path"
+                exec tail -n +1 -f "$log_path"
+            fi
+            sleep 2
+            waited=$((waited + 2))
+        done
+    ) &
+    INSTALL_LOG_TAIL_PID=$!
+}
+
+stop_install_log_tail() {
+    if [[ -n "$INSTALL_LOG_TAIL_PID" ]] && kill -0 "$INSTALL_LOG_TAIL_PID" 2>/dev/null; then
+        kill "$INSTALL_LOG_TAIL_PID" 2>/dev/null || true
+        wait "$INSTALL_LOG_TAIL_PID" 2>/dev/null || true
+    fi
+    INSTALL_LOG_TAIL_PID=""
+}
+
 check_install_errors() {
-    local install_err_path="${INSTALL_DIR%/}/install.err"
+    local install_err_path=""
+    install_err_path="$(install_err_path)"
 
     if [[ ! -e "$install_err_path" ]]; then
         success "No install.err file found under $INSTALL_DIR."
@@ -4551,6 +4597,16 @@ product_selection_display() {
         printf 'Expert (%d selected)' "${#SELECTED_PRODUCT_KEYS[@]}"
     else
         printf 'Expert (none selected)'
+    fi
+}
+
+menu_install_config_display() {
+    if [[ "$INSTALL_MODE" == "license_manager" ]]; then
+        printf 'LicMgr / N/A'
+    elif [[ "$PRODUCT_SELECTION_MODE" == "all" ]]; then
+        printf 'Products / All'
+    else
+        printf 'Products / Expert'
     fi
 }
 
@@ -4687,7 +4743,7 @@ run_installation() {
         warn "Install directory $INSTALL_DIR is not writable by the current user."
     fi
 
-    archive_install_err || true
+    archive_install_artifacts
     build_install_command install_cmd
     rendered="$(print_command "${install_cmd[@]}")"
 
@@ -4699,7 +4755,10 @@ run_installation() {
         return 0
     fi
 
+    info "Starting installer. install.log will stream here when the file appears."
+    start_install_log_tail
     if run_cmd "Running Ansys installer" "${install_cmd[@]}"; then
+        stop_install_log_tail
         STATUS_INSTALL_DONE=1
         success "Installer run completed."
         if (( CREATE_SYMLINK == 1 )); then
@@ -4714,6 +4773,7 @@ run_installation() {
         check_install_errors
         maybe_write_license_ini
     else
+        stop_install_log_tail
         warn "Installer returned a failure status."
         check_install_errors || true
     fi
@@ -4724,15 +4784,15 @@ run_installation() {
 show_main_menu() {
     header "$SCRIPT_NAME"
     status_line "1. Select Ansys Version" "${SELECTED_VERSION:-Not set}" "$([[ $STATUS_VERSION_SET -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
-    status_line "2. Select Source Directory" "${SOURCE_DIR:-Not set}" "$([[ $STATUS_SOURCE_SET -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
+    status_line "2. Select Source" "${SOURCE_DIR:-Not set}" "$([[ $STATUS_SOURCE_SET -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "3. Install Prerequisites" "$(profile_display_name "$PKG_PROFILE")" "$([[ $STATUS_PREREQS_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "4. Install Goodies" "$([[ $STATUS_GOODIES_DONE -eq 1 ]] && printf 'Installed' || printf 'Optional')" "$([[ $STATUS_GOODIES_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "5. Prepare Media" "${CURRENT_MEDIA_LABEL:-Not prepared}" "$([[ $STATUS_MEDIA_PREPARED -eq 1 ]] && printf 'READY' || printf 'PENDING')"
-    status_line "6. Configure Install" "$(installer_mode_display), $(product_selection_display)" "$([[ $STATUS_INSTALL_CONFIGURED -eq 1 ]] && printf 'DONE' || printf 'DEFAULTS')"
+    status_line "6. Configure Install" "$(menu_install_config_display)" "$([[ $STATUS_INSTALL_CONFIGURED -eq 1 ]] && printf 'DONE' || printf 'DEFAULTS')"
     status_line "7. Configure License" "${LICENSE_HOSTNAME:-Not set}" "$([[ $STATUS_LICENSE_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "8. Run Installation" "${INSTALL_DIR}" "$([[ $STATUS_INSTALL_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
-    status_line "9. Check Install Errors" "${INSTALL_DIR%/}/install.err" "INFO"
-    status_line "10. Cleanup Media" "Unmount and remove temp files" "ACTION"
+    status_line "9. Check install.err" "install.err" "INFO"
+    status_line "10. Unmount and Cleanup" "Unmount temp media" "ACTION"
     status_line "0. Exit" "Leave helper" "ACTION"
     separator
     printf 'OS: %s %s | Family: %s | Pkg Mgr: %s | Root: %s\n' \
@@ -4811,6 +4871,7 @@ parse_args() {
 }
 
 trap_handler() {
+    stop_install_log_tail || true
     cleanup_prepared_media || true
 }
 
