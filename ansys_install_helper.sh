@@ -2784,7 +2784,6 @@ PKGS_ALL_UBUNTU2404=(
     "libgcrypt20"
     "libgdk-pixbuf-2.0-0"
     "libgl1"
-    "libglapi-amber"
     "libglapi-mesa"
     "libglib2.0-0t64"
     "libglu1-mesa"
