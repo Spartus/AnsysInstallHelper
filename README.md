@@ -27,6 +27,26 @@ It currently supports these Linux families:
 - Ubuntu 22.04
 - Ubuntu 24.04
 
+Main Menu:
+<img width="520" height="240" alt="Main_Menu" src="https://github.com/user-attachments/assets/a2e82d3d-0a29-4776-a2c0-6cacd20a34af" />
+
+Select Prerequisites Groups:
+<img width="291" height="89" alt="Libraries" src="https://github.com/user-attachments/assets/f4026331-bf16-46a4-b69e-7edd98302cc9" />
+
+Confirm new packages:
+<img width="413" height="208" alt="Confirm_Packages" src="https://github.com/user-attachments/assets/7986027f-499c-49d1-8b4a-1c0485ae91d2" />
+
+Select Ansys Packages:
+<img width="719" height="359" alt="Select_Packages" src="https://github.com/user-attachments/assets/c3e6d231-0ea5-431f-8604-1c8cf119ea6a" />
+
+See install command and confirm (All ISOs are auto mounted and passed as sequence, or TGZ archive is extracted):
+<img width="491" height="480" alt="Install_confirmation" src="https://github.com/user-attachments/assets/f49ac967-aff8-458e-b419-b241ee1d968b" />
+
+Watch install progress:
+<img width="848" height="292" alt="Install_Progress" src="https://github.com/user-attachments/assets/541528e2-56f6-4831-bc48-bbcd783a0063" />
+
+Then see any errors, clean up temp files or ISO mounts, and you're done!
+
 ## Main script
 
 - `ansys_install_helper.sh`
