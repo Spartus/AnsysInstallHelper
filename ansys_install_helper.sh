@@ -12,9 +12,10 @@ COPYRIGHT_YEAR="2026"
 LOG_FILE="ansys_install_helper.log"
 DEFAULT_INSTALL_DIR="/usr/ansys_inc"
 SYMLINK_PATH="/ansys_inc"
-LICENSE_INI_RELATIVE="shared_files/licensing/ansyslmd.ini"
 MIN_DISK_SPACE_MB=50000
 MIN_TMP_SPACE_MB=2000
+LICENSE_INTERCONNECT_PORT=2325
+LICENSE_FLEXLM_PORT=1055
 SUPPORTED_VERSIONS=("2023R2" "2024R1" "2024R2" "2025R1" "2025R2" "2026R1")
 
 declare -A VERSION_CODES=(
@@ -3128,7 +3129,7 @@ init_whiptail_colors() {
         return 0
     fi
 
-    export NEWT_COLORS=$'root=,black\nwindow=black,lightgray\nborder=blue,lightgray\ntitle=blue,lightgray\ntextbox=black,lightgray\nlabel=black,lightgray\nentry=black,white\nbutton=black,white\nactbutton=white,blue\ncheckbox=black,lightgray\nactcheckbox=blue,lightgray\nlistbox=black,lightgray\nactlistbox=black,cyan\nsellistbox=black,cyan\nactsellistbox=black,cyan\nshadow=black,gray'
+    export NEWT_COLORS=$'root=,black\nwindow=black,lightgray\nborder=blue,lightgray\ntitle=blue,lightgray\ntextbox=black,lightgray\nacttextbox=black,cyan\nlabel=black,lightgray\nentry=black,white\nbutton=black,lightgray\ncompactbutton=black,lightgray\nactbutton=white,blue\nactcompactbutton=white,blue\ncheckbox=black,lightgray\nactcheckbox=white,blue\nlistbox=black,lightgray\nactlistbox=black,cyan\nsellistbox=black,cyan\nactsellistbox=white,blue\nshadow=black,gray'
 }
 
 ensure_log_file() {
@@ -4570,10 +4571,6 @@ prepare_media() {
     esac
 }
 
-license_ini_path() {
-    printf '%s/%s\n' "${INSTALL_DIR%/}" "$LICENSE_INI_RELATIVE"
-}
-
 install_err_path() {
     printf '%s/install.err\n' "${INSTALL_DIR%/}"
 }
@@ -4652,39 +4649,6 @@ check_install_errors() {
     separator
 }
 
-maybe_write_license_ini() {
-    local ini_path=""
-    local ini_dir=""
-
-    if [[ -z "$LICENSE_HOSTNAME" ]]; then
-        return 0
-    fi
-
-    ini_path="$(license_ini_path)"
-    ini_dir="$(dirname "$ini_path")"
-
-    if [[ ! -d "$ini_dir" ]]; then
-        warn "License directory does not exist yet: $ini_dir"
-        return 0
-    fi
-
-    if [[ -e "$ini_path" ]]; then
-        info "License file already exists at $ini_path; leaving it unchanged."
-        STATUS_LICENSE_DONE=1
-        return 0
-    fi
-
-    if (( DRY_RUN )); then
-        info "[dry-run] would write $ini_path with SERVER=1055@$LICENSE_HOSTNAME"
-        STATUS_LICENSE_DONE=1
-        return 0
-    fi
-
-    printf 'SERVER=1055@%s\n' "$LICENSE_HOSTNAME" >"$ini_path"
-    success "Wrote license configuration to $ini_path."
-    STATUS_LICENSE_DONE=1
-}
-
 configure_license() {
     local choice=""
     local hostname=""
@@ -4701,11 +4665,8 @@ configure_license() {
                 warn "License hostname cannot be empty."
             else
                 LICENSE_HOSTNAME="$hostname"
-                STATUS_LICENSE_DONE=0
+                STATUS_LICENSE_DONE=1
                 success "Stored license hostname: $LICENSE_HOSTNAME"
-                if (( STATUS_INSTALL_DONE == 1 )); then
-                    maybe_write_license_ini
-                fi
             fi
             ;;
         2)
@@ -4748,6 +4709,13 @@ menu_install_config_display() {
     else
         printf 'Products / Expert'
     fi
+}
+
+license_server_info() {
+    if [[ -z "$LICENSE_HOSTNAME" ]]; then
+        return 1
+    fi
+    printf '%s:%s:%s\n' "$LICENSE_INTERCONNECT_PORT" "$LICENSE_FLEXLM_PORT" "$LICENSE_HOSTNAME"
 }
 
 configure_install_options() {
@@ -4835,6 +4803,9 @@ build_install_command() {
     if (( ${#MEDIA_EXTRA_ARGS[@]} > 0 )); then
         output_ref+=("${MEDIA_EXTRA_ARGS[@]}")
     fi
+    if [[ -n "$LICENSE_HOSTNAME" ]]; then
+        output_ref+=(-licserverinfo "$(license_server_info)")
+    fi
     if (( INSTALLER_NOCHECKS == 1 )); then
         output_ref+=(-nochecks)
     fi
@@ -4912,7 +4883,6 @@ run_installation() {
             fi
         fi
         check_install_errors
-        maybe_write_license_ini
     else
         stop_install_log_tail
         warn "Installer returned a failure status."
