@@ -79,6 +79,7 @@ STATUS_INSTALL_CONFIGURED=0
 STATUS_INSTALL_DONE=0
 STATUS_LICENSE_DONE=0
 INSTALL_LOG_TAIL_PID=""
+WHIPTAIL_AVAILABLE=0
 
 RED=""
 GREEN=""
@@ -3122,6 +3123,14 @@ init_colors() {
     fi
 }
 
+init_whiptail_colors() {
+    if [[ -n ${NEWT_COLORS:-} ]] || (( NO_COLOR )); then
+        return 0
+    fi
+
+    export NEWT_COLORS=$'root=,black\nwindow=black,lightgray\nborder=blue,lightgray\ntitle=blue,lightgray\ntextbox=black,lightgray\nlabel=black,lightgray\nentry=black,white\nbutton=black,white\nactbutton=white,blue\ncheckbox=black,lightgray\nactcheckbox=blue,lightgray\nlistbox=black,lightgray\nactlistbox=black,cyan\nsellistbox=black,cyan\nactsellistbox=black,cyan\nshadow=black,gray'
+}
+
 ensure_log_file() {
     touch "$LOG_PATH"
 }
@@ -3467,6 +3476,42 @@ install_packages() {
             return 1
             ;;
     esac
+}
+
+ensure_whiptail() {
+    local package_name=""
+
+    if command -v whiptail >/dev/null 2>&1; then
+        WHIPTAIL_AVAILABLE=1
+        return 0
+    fi
+
+    warn "whiptail is not installed. Attempting to install it for checklist-based product selection."
+
+    if (( IS_ROOT == 0 )); then
+        warn "Cannot auto-install whiptail without root. Falling back to text prompts."
+        WHIPTAIL_AVAILABLE=0
+        return 0
+    fi
+
+    case "$PKG_MGR" in
+        apt) package_name="whiptail" ;;
+        dnf|zypper) package_name="newt" ;;
+        *)
+            warn "Unknown package manager '$PKG_MGR'; cannot auto-install whiptail."
+            WHIPTAIL_AVAILABLE=0
+            return 0
+            ;;
+    esac
+
+    if install_packages "$package_name" && command -v whiptail >/dev/null 2>&1; then
+        success "Installed whiptail support."
+        WHIPTAIL_AVAILABLE=1
+        return 0
+    fi
+
+    warn "whiptail is still unavailable. Falling back to text prompts."
+    WHIPTAIL_AVAILABLE=0
 }
 
 dedupe_array() {
@@ -3872,16 +3917,98 @@ toggle_cad_group() {
     fi
 }
 
+selected_cad_group_for_version() {
+    local -n keys_ref=$1
+    local cad_key=""
+    local has_cad=0
+
+    for cad_key in "${CAD_READER_KEYS[@]}"; do
+        if array_contains "$cad_key" "${keys_ref[@]}"; then
+            has_cad=1
+            if ! array_contains "$cad_key" "${SELECTED_PRODUCT_KEYS[@]}"; then
+                return 1
+            fi
+        fi
+    done
+
+    (( has_cad == 1 ))
+}
+
+whiptail_dimensions() {
+    local term_lines=24
+    local cols=90
+    local menu_height=16
+    local lines=24
+
+    if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
+        term_lines="$(tput lines 2>/dev/null || printf '24')"
+        cols="$(tput cols 2>/dev/null || printf '90')"
+    fi
+
+    lines="$term_lines"
+    (( lines < 20 )) && lines=20
+    (( cols < 80 )) && cols=80
+    menu_height=$((lines - 8))
+    (( menu_height < 10 )) && menu_height=10
+
+    printf '%s %s %s\n' "$lines" "$cols" "$menu_height"
+}
+
+run_whiptail_product_checklist() {
+    local -n valid_keys_ref=$1
+    local whiptail_args=()
+    local selected_output=""
+    local key=""
+    local tag=""
+    local default_state="OFF"
+    local lines=24
+    local cols=90
+    local menu_height=16
+    local idx=0
+
+    if (( WHIPTAIL_AVAILABLE == 0 )) || ! command -v whiptail >/dev/null 2>&1 || [[ ! -t 0 || ! -t 2 ]]; then
+        return 1
+    fi
+
+    read -r lines cols menu_height <<<"$(whiptail_dimensions)"
+    for (( idx=0; idx<${#valid_keys_ref[@]}; idx+=1 )); do
+        key="${valid_keys_ref[idx]}"
+        printf -v tag '%03d' "$((idx + 1))"
+        default_state="OFF"
+        if array_contains "$key" "${SELECTED_PRODUCT_KEYS[@]}"; then
+            default_state="ON"
+        fi
+        whiptail_args+=("$tag" "$(display_product_name "$key")" "$default_state")
+    done
+
+    if array_contains "acad_reader" "${valid_keys_ref[@]}" || array_contains "catia5_reader" "${valid_keys_ref[@]}" || array_contains "acis" "${valid_keys_ref[@]}"; then
+        if selected_cad_group_for_version valid_keys_ref; then
+            default_state="ON"
+        else
+            default_state="OFF"
+        fi
+        whiptail_args+=("CAD" "CAD Readers Group" "$default_state")
+    fi
+
+    selected_output=$(whiptail \
+        --title "Ansys Product Selection" \
+        --separate-output \
+        --checklist "Use Space to toggle products, Tab to move, Enter to accept." \
+        "$lines" "$cols" "$menu_height" \
+        "${whiptail_args[@]}" \
+        3>&1 1>&2 2>&3) || return 1
+
+    printf '%s\n' "$selected_output"
+}
+
 select_products() {
     local mode_choice=""
     local valid_keys=()
-    local idx=1
     local key=""
-    local answer=""
-    local group_index=0
-    local display_state=""
-    local tokens=()
+    local selected_output=""
+    local selected_tokens=()
     local token=""
+    local normalized=()
 
     if [[ "$INSTALL_MODE" == "license_manager" ]]; then
         warn "Product selection is not used for License Manager mode."
@@ -3910,72 +4037,44 @@ select_products() {
     fi
 
     PRODUCT_SELECTION_MODE="expert"
-    while true; do
-        header "Expert Product Selection"
-        idx=1
-        for key in "${valid_keys[@]}"; do
-            if array_contains "$key" "${SELECTED_PRODUCT_KEYS[@]}"; then
-                display_state="[X]"
-            else
-                display_state="[ ]"
-            fi
-            printf '  %2d. %s %s\n' "$idx" "$display_state" "$(display_product_name "$key")"
-            ((idx += 1))
-        done
-
-        group_index=$idx
-        if array_contains "catia5_reader" "${valid_keys[@]}" || array_contains "acad_reader" "${valid_keys[@]}" || array_contains "acis" "${valid_keys[@]}"; then
-            if array_contains "acis" "${SELECTED_PRODUCT_KEYS[@]}" || array_contains "catia5_reader" "${SELECTED_PRODUCT_KEYS[@]}" || array_contains "acad_reader" "${SELECTED_PRODUCT_KEYS[@]}"; then
-                display_state="[X]"
-            else
-                display_state="[ ]"
-            fi
-            printf '  %2d. %s CAD Readers Group\n' "$group_index" "$display_state"
-        else
-            group_index=0
+    if selected_output="$(run_whiptail_product_checklist valid_keys)"; then
+        selected_tokens=()
+        if [[ -n "$selected_output" ]]; then
+            mapfile -t selected_tokens <<<"$selected_output"
         fi
 
-        printf '\nEnter numbers to toggle, separated by spaces.\n'
-        printf 'Press Enter when done, or type all / none.\n\n'
-        read -r -p "Selection: " answer
-
-        if [[ -z "$answer" ]]; then
-            if (( ${#SELECTED_PRODUCT_KEYS[@]} == 0 )); then
-                warn "No products are selected. Choose at least one product or use Install Everything."
-                continue
-            fi
-            STATUS_INSTALL_CONFIGURED=1
-            success "Stored expert product selection for this session."
-            pause
-            return 0
-        fi
-
-        case "$answer" in
-            all|ALL)
-                SELECTED_PRODUCT_KEYS=("${valid_keys[@]}")
-                continue
-                ;;
-            none|NONE)
-                SELECTED_PRODUCT_KEYS=()
-                continue
-                ;;
-        esac
-
-        read -r -a tokens <<<"$answer"
-        for token in "${tokens[@]}"; do
-            if [[ ! "$token" =~ ^[0-9]+$ ]]; then
-                warn "Ignoring invalid token: $token"
-                continue
-            fi
-            if (( token >= 1 && token <= ${#valid_keys[@]} )); then
-                toggle_key_in_selection "${valid_keys[token-1]}"
-            elif (( group_index > 0 && token == group_index )); then
-                toggle_cad_group
-            else
-                warn "Ignoring out-of-range selection: $token"
+        normalized=()
+        for token in "${selected_tokens[@]}"; do
+            if [[ "$token" == "CAD" ]]; then
+                for key in "${CAD_READER_KEYS[@]}"; do
+                    if array_contains "$key" "${valid_keys[@]}"; then
+                        normalized+=("$key")
+                    fi
+                done
+            elif [[ "$token" =~ ^[0-9]+$ ]] && (( 10#$token >= 1 && 10#$token <= ${#valid_keys[@]} )); then
+                normalized+=("${valid_keys[10#$token-1]}")
+            elif array_contains "$token" "${valid_keys[@]}"; then
+                normalized+=("$token")
             fi
         done
-    done
+
+        SELECTED_PRODUCT_KEYS=()
+        dedupe_array normalized SELECTED_PRODUCT_KEYS
+    else
+        warn "whiptail selection was cancelled or unavailable. Keeping the previous product selection."
+        pause
+        return 0
+    fi
+
+    if (( ${#SELECTED_PRODUCT_KEYS[@]} == 0 )); then
+        warn "No products are selected. Use Install Everything or choose at least one product."
+        pause
+        return 0
+    fi
+
+    STATUS_INSTALL_CONFIGURED=1
+    success "Stored expert product selection for this session."
+    pause
 }
 
 ensure_extra_path_for_product() {
@@ -4022,6 +4121,48 @@ build_product_flags() {
         output_ref+=("-$key")
         if [[ -n ${PRODUCT_EXTRA_FLAG[$key]:-} ]]; then
             output_ref+=("${PRODUCT_EXTRA_FLAG[$key]}" "${PRODUCT_EXTRA_PATHS[$key]}")
+        fi
+    done
+}
+
+is_install_arg_pair_flag() {
+    case "$1" in
+        -install_dir|-usetempdir|-avxlib_path|-carmaker_path|-sensors_scaner_path)
+            return 0
+            ;;
+        -media_dir*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+format_install_command_preview() {
+    local args=("$@")
+    local idx=0
+    local line=""
+
+    if (( ${#args[@]} == 0 )); then
+        return 0
+    fi
+
+    printf '%s \\\n' "$(print_command "${args[0]}")"
+    idx=1
+    while (( idx < ${#args[@]} )); do
+        if is_install_arg_pair_flag "${args[idx]}" && (( idx + 1 < ${#args[@]} )); then
+            line="$(print_command "${args[idx]}" "${args[idx+1]}")"
+            idx=$((idx + 2))
+        else
+            line="$(print_command "${args[idx]}")"
+            idx=$((idx + 1))
+        fi
+
+        if (( idx < ${#args[@]} )); then
+            printf '  %s \\\n' "$line"
+        else
+            printf '  %s\n' "$line"
         fi
     done
 }
@@ -4747,7 +4888,8 @@ run_installation() {
     rendered="$(print_command "${install_cmd[@]}")"
 
     header "Installer Command"
-    printf '%s\n\n' "$rendered"
+    format_install_command_preview "${install_cmd[@]}"
+    printf '\n'
     if ! prompt_yn "Run this installer command?" y; then
         warn "Installation cancelled."
         pause
@@ -4901,12 +5043,14 @@ main() {
     require_bash_version
     parse_args "$@"
     init_colors
+    init_whiptail_colors
     banner
     ensure_log_file
     log "Session started"
     load_package_arrays
     detect_os || true
     check_root
+    ensure_whiptail
     check_disk_space
     trap trap_handler EXIT INT TERM
 
