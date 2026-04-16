@@ -12,9 +12,10 @@ COPYRIGHT_YEAR="2026"
 LOG_FILE="ansys_install_helper.log"
 DEFAULT_INSTALL_DIR="/usr/ansys_inc"
 SYMLINK_PATH="/ansys_inc"
-LICENSE_INI_RELATIVE="shared_files/licensing/ansyslmd.ini"
 MIN_DISK_SPACE_MB=50000
 MIN_TMP_SPACE_MB=2000
+LICENSE_INTERCONNECT_PORT=2325
+LICENSE_FLEXLM_PORT=1055
 SUPPORTED_VERSIONS=("2023R2" "2024R1" "2024R2" "2025R1" "2025R2" "2026R1")
 
 declare -A VERSION_CODES=(
@@ -78,6 +79,8 @@ STATUS_MEDIA_PREPARED=0
 STATUS_INSTALL_CONFIGURED=0
 STATUS_INSTALL_DONE=0
 STATUS_LICENSE_DONE=0
+INSTALL_LOG_TAIL_PID=""
+WHIPTAIL_AVAILABLE=0
 
 RED=""
 GREEN=""
@@ -2783,7 +2786,6 @@ PKGS_ALL_UBUNTU2404=(
     "libgcrypt20"
     "libgdk-pixbuf-2.0-0"
     "libgl1"
-    "libglapi-amber"
     "libglapi-mesa"
     "libglib2.0-0t64"
     "libglu1-mesa"
@@ -3122,6 +3124,14 @@ init_colors() {
     fi
 }
 
+init_whiptail_colors() {
+    if [[ -n ${NEWT_COLORS:-} ]] || (( NO_COLOR )); then
+        return 0
+    fi
+
+    export NEWT_COLORS=$'root=,black\nwindow=black,lightgray\nborder=blue,lightgray\ntitle=blue,lightgray\ntextbox=black,lightgray\nacttextbox=black,cyan\nlabel=black,lightgray\nentry=black,white\nbutton=black,lightgray\ncompactbutton=black,lightgray\nactbutton=white,blue\nactcompactbutton=white,blue\ncheckbox=black,lightgray\nactcheckbox=white,blue\nlistbox=black,lightgray\nactlistbox=black,cyan\nsellistbox=black,cyan\nactsellistbox=white,blue\nshadow=black,gray'
+}
+
 ensure_log_file() {
     touch "$LOG_PATH"
 }
@@ -3245,7 +3255,7 @@ status_line() {
     local label="$1"
     local value="$2"
     local state="$3"
-    printf '  %-28s [%-22s] %s\n' "$label" "$value" "$state"
+    printf '  %-24.24s [%-20.20s] %s\n' "$label" "$value" "$state"
 }
 
 print_command() {
@@ -3467,6 +3477,42 @@ install_packages() {
             return 1
             ;;
     esac
+}
+
+ensure_whiptail() {
+    local package_name=""
+
+    if command -v whiptail >/dev/null 2>&1; then
+        WHIPTAIL_AVAILABLE=1
+        return 0
+    fi
+
+    warn "whiptail is not installed. Attempting to install it for checklist-based product selection."
+
+    if (( IS_ROOT == 0 )); then
+        warn "Cannot auto-install whiptail without root. Falling back to text prompts."
+        WHIPTAIL_AVAILABLE=0
+        return 0
+    fi
+
+    case "$PKG_MGR" in
+        apt) package_name="whiptail" ;;
+        dnf|zypper) package_name="newt" ;;
+        *)
+            warn "Unknown package manager '$PKG_MGR'; cannot auto-install whiptail."
+            WHIPTAIL_AVAILABLE=0
+            return 0
+            ;;
+    esac
+
+    if install_packages "$package_name" && command -v whiptail >/dev/null 2>&1; then
+        success "Installed whiptail support."
+        WHIPTAIL_AVAILABLE=1
+        return 0
+    fi
+
+    warn "whiptail is still unavailable. Falling back to text prompts."
+    WHIPTAIL_AVAILABLE=0
 }
 
 dedupe_array() {
@@ -3872,16 +3918,98 @@ toggle_cad_group() {
     fi
 }
 
+selected_cad_group_for_version() {
+    local -n keys_ref=$1
+    local cad_key=""
+    local has_cad=0
+
+    for cad_key in "${CAD_READER_KEYS[@]}"; do
+        if array_contains "$cad_key" "${keys_ref[@]}"; then
+            has_cad=1
+            if ! array_contains "$cad_key" "${SELECTED_PRODUCT_KEYS[@]}"; then
+                return 1
+            fi
+        fi
+    done
+
+    (( has_cad == 1 ))
+}
+
+whiptail_dimensions() {
+    local term_lines=24
+    local cols=90
+    local menu_height=16
+    local lines=24
+
+    if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
+        term_lines="$(tput lines 2>/dev/null || printf '24')"
+        cols="$(tput cols 2>/dev/null || printf '90')"
+    fi
+
+    lines="$term_lines"
+    (( lines < 20 )) && lines=20
+    (( cols < 80 )) && cols=80
+    menu_height=$((lines - 8))
+    (( menu_height < 10 )) && menu_height=10
+
+    printf '%s %s %s\n' "$lines" "$cols" "$menu_height"
+}
+
+run_whiptail_product_checklist() {
+    local -n valid_keys_ref=$1
+    local whiptail_args=()
+    local selected_output=""
+    local key=""
+    local tag=""
+    local default_state="OFF"
+    local lines=24
+    local cols=90
+    local menu_height=16
+    local idx=0
+
+    if (( WHIPTAIL_AVAILABLE == 0 )) || ! command -v whiptail >/dev/null 2>&1 || [[ ! -t 0 || ! -t 2 ]]; then
+        return 1
+    fi
+
+    read -r lines cols menu_height <<<"$(whiptail_dimensions)"
+    for (( idx=0; idx<${#valid_keys_ref[@]}; idx+=1 )); do
+        key="${valid_keys_ref[idx]}"
+        printf -v tag '%03d' "$((idx + 1))"
+        default_state="OFF"
+        if array_contains "$key" "${SELECTED_PRODUCT_KEYS[@]}"; then
+            default_state="ON"
+        fi
+        whiptail_args+=("$tag" "$(display_product_name "$key")" "$default_state")
+    done
+
+    if array_contains "acad_reader" "${valid_keys_ref[@]}" || array_contains "catia5_reader" "${valid_keys_ref[@]}" || array_contains "acis" "${valid_keys_ref[@]}"; then
+        if selected_cad_group_for_version valid_keys_ref; then
+            default_state="ON"
+        else
+            default_state="OFF"
+        fi
+        whiptail_args+=("CAD" "CAD Readers Group" "$default_state")
+    fi
+
+    selected_output=$(whiptail \
+        --title "Ansys Product Selection" \
+        --separate-output \
+        --checklist "Use Space to toggle products, Tab to move, Enter to accept." \
+        "$lines" "$cols" "$menu_height" \
+        "${whiptail_args[@]}" \
+        3>&1 1>&2 2>&3) || return 1
+
+    printf '%s\n' "$selected_output"
+}
+
 select_products() {
     local mode_choice=""
     local valid_keys=()
-    local idx=1
     local key=""
-    local answer=""
-    local group_index=0
-    local display_state=""
-    local tokens=()
+    local selected_output=""
+    local selected_tokens=()
     local token=""
+    local normalized=()
 
     if [[ "$INSTALL_MODE" == "license_manager" ]]; then
         warn "Product selection is not used for License Manager mode."
@@ -3910,72 +4038,44 @@ select_products() {
     fi
 
     PRODUCT_SELECTION_MODE="expert"
-    while true; do
-        header "Expert Product Selection"
-        idx=1
-        for key in "${valid_keys[@]}"; do
-            if array_contains "$key" "${SELECTED_PRODUCT_KEYS[@]}"; then
-                display_state="[X]"
-            else
-                display_state="[ ]"
-            fi
-            printf '  %2d. %s %s\n' "$idx" "$display_state" "$(display_product_name "$key")"
-            ((idx += 1))
-        done
-
-        group_index=$idx
-        if array_contains "catia5_reader" "${valid_keys[@]}" || array_contains "acad_reader" "${valid_keys[@]}" || array_contains "acis" "${valid_keys[@]}"; then
-            if array_contains "acis" "${SELECTED_PRODUCT_KEYS[@]}" || array_contains "catia5_reader" "${SELECTED_PRODUCT_KEYS[@]}" || array_contains "acad_reader" "${SELECTED_PRODUCT_KEYS[@]}"; then
-                display_state="[X]"
-            else
-                display_state="[ ]"
-            fi
-            printf '  %2d. %s CAD Readers Group\n' "$group_index" "$display_state"
-        else
-            group_index=0
+    if selected_output="$(run_whiptail_product_checklist valid_keys)"; then
+        selected_tokens=()
+        if [[ -n "$selected_output" ]]; then
+            mapfile -t selected_tokens <<<"$selected_output"
         fi
 
-        printf '\nEnter numbers to toggle, separated by spaces.\n'
-        printf 'Press Enter when done, or type all / none.\n\n'
-        read -r -p "Selection: " answer
-
-        if [[ -z "$answer" ]]; then
-            if (( ${#SELECTED_PRODUCT_KEYS[@]} == 0 )); then
-                warn "No products are selected. Choose at least one product or use Install Everything."
-                continue
-            fi
-            STATUS_INSTALL_CONFIGURED=1
-            success "Stored expert product selection for this session."
-            pause
-            return 0
-        fi
-
-        case "$answer" in
-            all|ALL)
-                SELECTED_PRODUCT_KEYS=("${valid_keys[@]}")
-                continue
-                ;;
-            none|NONE)
-                SELECTED_PRODUCT_KEYS=()
-                continue
-                ;;
-        esac
-
-        read -r -a tokens <<<"$answer"
-        for token in "${tokens[@]}"; do
-            if [[ ! "$token" =~ ^[0-9]+$ ]]; then
-                warn "Ignoring invalid token: $token"
-                continue
-            fi
-            if (( token >= 1 && token <= ${#valid_keys[@]} )); then
-                toggle_key_in_selection "${valid_keys[token-1]}"
-            elif (( group_index > 0 && token == group_index )); then
-                toggle_cad_group
-            else
-                warn "Ignoring out-of-range selection: $token"
+        normalized=()
+        for token in "${selected_tokens[@]}"; do
+            if [[ "$token" == "CAD" ]]; then
+                for key in "${CAD_READER_KEYS[@]}"; do
+                    if array_contains "$key" "${valid_keys[@]}"; then
+                        normalized+=("$key")
+                    fi
+                done
+            elif [[ "$token" =~ ^[0-9]+$ ]] && (( 10#$token >= 1 && 10#$token <= ${#valid_keys[@]} )); then
+                normalized+=("${valid_keys[10#$token-1]}")
+            elif array_contains "$token" "${valid_keys[@]}"; then
+                normalized+=("$token")
             fi
         done
-    done
+
+        SELECTED_PRODUCT_KEYS=()
+        dedupe_array normalized SELECTED_PRODUCT_KEYS
+    else
+        warn "whiptail selection was cancelled or unavailable. Keeping the previous product selection."
+        pause
+        return 0
+    fi
+
+    if (( ${#SELECTED_PRODUCT_KEYS[@]} == 0 )); then
+        warn "No products are selected. Use Install Everything or choose at least one product."
+        pause
+        return 0
+    fi
+
+    STATUS_INSTALL_CONFIGURED=1
+    success "Stored expert product selection for this session."
+    pause
 }
 
 ensure_extra_path_for_product() {
@@ -4022,6 +4122,48 @@ build_product_flags() {
         output_ref+=("-$key")
         if [[ -n ${PRODUCT_EXTRA_FLAG[$key]:-} ]]; then
             output_ref+=("${PRODUCT_EXTRA_FLAG[$key]}" "${PRODUCT_EXTRA_PATHS[$key]}")
+        fi
+    done
+}
+
+is_install_arg_pair_flag() {
+    case "$1" in
+        -install_dir|-usetempdir|-avxlib_path|-carmaker_path|-sensors_scaner_path)
+            return 0
+            ;;
+        -media_dir*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+format_install_command_preview() {
+    local args=("$@")
+    local idx=0
+    local line=""
+
+    if (( ${#args[@]} == 0 )); then
+        return 0
+    fi
+
+    printf '%s \\\n' "$(print_command "${args[0]}")"
+    idx=1
+    while (( idx < ${#args[@]} )); do
+        if is_install_arg_pair_flag "${args[idx]}" && (( idx + 1 < ${#args[@]} )); then
+            line="$(print_command "${args[idx]}" "${args[idx+1]}")"
+            idx=$((idx + 2))
+        else
+            line="$(print_command "${args[idx]}")"
+            idx=$((idx + 1))
+        fi
+
+        if (( idx < ${#args[@]} )); then
+            printf '  %s \\\n' "$line"
+        else
+            printf '  %s\n' "$line"
         fi
     done
 }
@@ -4429,26 +4571,67 @@ prepare_media() {
     esac
 }
 
-license_ini_path() {
-    printf '%s/%s\n' "${INSTALL_DIR%/}" "$LICENSE_INI_RELATIVE"
+install_err_path() {
+    printf '%s/install.err\n' "${INSTALL_DIR%/}"
 }
 
-archive_install_err() {
-    local install_err_path="${INSTALL_DIR%/}/install.err"
+install_log_path() {
+    printf '%s/install.log\n' "${INSTALL_DIR%/}"
+}
+
+archive_existing_installer_file() {
+    local file_path="$1"
     local archive_path=""
 
-    if [[ ! -e "$install_err_path" ]]; then
+    if [[ ! -e "$file_path" ]]; then
         return 0
     fi
 
-    archive_path="${install_err_path}.old.$(date '+%Y%m%d_%H%M%S')"
-    if run_cmd "Archiving previous install.err" mv "$install_err_path" "$archive_path"; then
-        info "Archived existing install.err to $(basename "$archive_path")."
+    archive_path="${file_path}.old.$(date '+%Y%m%d_%H%M%S')"
+    if run_cmd "Archiving $(basename "$file_path")" mv "$file_path" "$archive_path"; then
+        info "Archived existing $(basename "$file_path") to $(basename "$archive_path")."
     fi
 }
 
+archive_install_artifacts() {
+    archive_existing_installer_file "$(install_err_path)" || true
+    archive_existing_installer_file "$(install_log_path)" || true
+}
+
+start_install_log_tail() {
+    local log_path=""
+    log_path="$(install_log_path)"
+
+    INSTALL_LOG_TAIL_PID=""
+    if (( DRY_RUN )); then
+        return 0
+    fi
+
+    (
+        local waited=0
+        while (( waited < 7200 )); do
+            if [[ -f "$log_path" ]]; then
+                printf '\n[INFO] Streaming %s\n\n' "$log_path"
+                exec tail -n +1 -f "$log_path"
+            fi
+            sleep 2
+            waited=$((waited + 2))
+        done
+    ) &
+    INSTALL_LOG_TAIL_PID=$!
+}
+
+stop_install_log_tail() {
+    if [[ -n "$INSTALL_LOG_TAIL_PID" ]] && kill -0 "$INSTALL_LOG_TAIL_PID" 2>/dev/null; then
+        kill "$INSTALL_LOG_TAIL_PID" 2>/dev/null || true
+        wait "$INSTALL_LOG_TAIL_PID" 2>/dev/null || true
+    fi
+    INSTALL_LOG_TAIL_PID=""
+}
+
 check_install_errors() {
-    local install_err_path="${INSTALL_DIR%/}/install.err"
+    local install_err_path=""
+    install_err_path="$(install_err_path)"
 
     if [[ ! -e "$install_err_path" ]]; then
         success "No install.err file found under $INSTALL_DIR."
@@ -4464,39 +4647,6 @@ check_install_errors() {
     separator
     sed -n '1,200p' "$install_err_path"
     separator
-}
-
-maybe_write_license_ini() {
-    local ini_path=""
-    local ini_dir=""
-
-    if [[ -z "$LICENSE_HOSTNAME" ]]; then
-        return 0
-    fi
-
-    ini_path="$(license_ini_path)"
-    ini_dir="$(dirname "$ini_path")"
-
-    if [[ ! -d "$ini_dir" ]]; then
-        warn "License directory does not exist yet: $ini_dir"
-        return 0
-    fi
-
-    if [[ -e "$ini_path" ]]; then
-        info "License file already exists at $ini_path; leaving it unchanged."
-        STATUS_LICENSE_DONE=1
-        return 0
-    fi
-
-    if (( DRY_RUN )); then
-        info "[dry-run] would write $ini_path with SERVER=1055@$LICENSE_HOSTNAME"
-        STATUS_LICENSE_DONE=1
-        return 0
-    fi
-
-    printf 'SERVER=1055@%s\n' "$LICENSE_HOSTNAME" >"$ini_path"
-    success "Wrote license configuration to $ini_path."
-    STATUS_LICENSE_DONE=1
 }
 
 configure_license() {
@@ -4515,11 +4665,8 @@ configure_license() {
                 warn "License hostname cannot be empty."
             else
                 LICENSE_HOSTNAME="$hostname"
-                STATUS_LICENSE_DONE=0
+                STATUS_LICENSE_DONE=1
                 success "Stored license hostname: $LICENSE_HOSTNAME"
-                if (( STATUS_INSTALL_DONE == 1 )); then
-                    maybe_write_license_ini
-                fi
             fi
             ;;
         2)
@@ -4552,6 +4699,23 @@ product_selection_display() {
     else
         printf 'Expert (none selected)'
     fi
+}
+
+menu_install_config_display() {
+    if [[ "$INSTALL_MODE" == "license_manager" ]]; then
+        printf 'LicMgr / N/A'
+    elif [[ "$PRODUCT_SELECTION_MODE" == "all" ]]; then
+        printf 'Products / All'
+    else
+        printf 'Products / Expert'
+    fi
+}
+
+license_server_info() {
+    if [[ -z "$LICENSE_HOSTNAME" ]]; then
+        return 1
+    fi
+    printf '%s:%s:%s\n' "$LICENSE_INTERCONNECT_PORT" "$LICENSE_FLEXLM_PORT" "$LICENSE_HOSTNAME"
 }
 
 configure_install_options() {
@@ -4639,6 +4803,9 @@ build_install_command() {
     if (( ${#MEDIA_EXTRA_ARGS[@]} > 0 )); then
         output_ref+=("${MEDIA_EXTRA_ARGS[@]}")
     fi
+    if [[ -n "$LICENSE_HOSTNAME" ]]; then
+        output_ref+=(-licserverinfo "$(license_server_info)")
+    fi
     if (( INSTALLER_NOCHECKS == 1 )); then
         output_ref+=(-nochecks)
     fi
@@ -4687,19 +4854,23 @@ run_installation() {
         warn "Install directory $INSTALL_DIR is not writable by the current user."
     fi
 
-    archive_install_err || true
+    archive_install_artifacts
     build_install_command install_cmd
     rendered="$(print_command "${install_cmd[@]}")"
 
     header "Installer Command"
-    printf '%s\n\n' "$rendered"
+    format_install_command_preview "${install_cmd[@]}"
+    printf '\n'
     if ! prompt_yn "Run this installer command?" y; then
         warn "Installation cancelled."
         pause
         return 0
     fi
 
+    info "Starting installer. install.log will stream here when the file appears."
+    start_install_log_tail
     if run_cmd "Running Ansys installer" "${install_cmd[@]}"; then
+        stop_install_log_tail
         STATUS_INSTALL_DONE=1
         success "Installer run completed."
         if (( CREATE_SYMLINK == 1 )); then
@@ -4712,8 +4883,8 @@ run_installation() {
             fi
         fi
         check_install_errors
-        maybe_write_license_ini
     else
+        stop_install_log_tail
         warn "Installer returned a failure status."
         check_install_errors || true
     fi
@@ -4724,15 +4895,15 @@ run_installation() {
 show_main_menu() {
     header "$SCRIPT_NAME"
     status_line "1. Select Ansys Version" "${SELECTED_VERSION:-Not set}" "$([[ $STATUS_VERSION_SET -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
-    status_line "2. Select Source Directory" "${SOURCE_DIR:-Not set}" "$([[ $STATUS_SOURCE_SET -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
+    status_line "2. Select Source" "${SOURCE_DIR:-Not set}" "$([[ $STATUS_SOURCE_SET -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "3. Install Prerequisites" "$(profile_display_name "$PKG_PROFILE")" "$([[ $STATUS_PREREQS_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "4. Install Goodies" "$([[ $STATUS_GOODIES_DONE -eq 1 ]] && printf 'Installed' || printf 'Optional')" "$([[ $STATUS_GOODIES_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "5. Prepare Media" "${CURRENT_MEDIA_LABEL:-Not prepared}" "$([[ $STATUS_MEDIA_PREPARED -eq 1 ]] && printf 'READY' || printf 'PENDING')"
-    status_line "6. Configure Install" "$(installer_mode_display), $(product_selection_display)" "$([[ $STATUS_INSTALL_CONFIGURED -eq 1 ]] && printf 'DONE' || printf 'DEFAULTS')"
+    status_line "6. Configure Install" "$(menu_install_config_display)" "$([[ $STATUS_INSTALL_CONFIGURED -eq 1 ]] && printf 'DONE' || printf 'DEFAULTS')"
     status_line "7. Configure License" "${LICENSE_HOSTNAME:-Not set}" "$([[ $STATUS_LICENSE_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
     status_line "8. Run Installation" "${INSTALL_DIR}" "$([[ $STATUS_INSTALL_DONE -eq 1 ]] && printf 'DONE' || printf 'PENDING')"
-    status_line "9. Check Install Errors" "${INSTALL_DIR%/}/install.err" "INFO"
-    status_line "10. Cleanup Media" "Unmount and remove temp files" "ACTION"
+    status_line "9. Check install.err" "install.err" "INFO"
+    status_line "10. Unmount and Cleanup" "Unmount temp media" "ACTION"
     status_line "0. Exit" "Leave helper" "ACTION"
     separator
     printf 'OS: %s %s | Family: %s | Pkg Mgr: %s | Root: %s\n' \
@@ -4811,6 +4982,7 @@ parse_args() {
 }
 
 trap_handler() {
+    stop_install_log_tail || true
     cleanup_prepared_media || true
 }
 
@@ -4841,12 +5013,14 @@ main() {
     require_bash_version
     parse_args "$@"
     init_colors
+    init_whiptail_colors
     banner
     ensure_log_file
     log "Session started"
     load_package_arrays
     detect_os || true
     check_root
+    ensure_whiptail
     check_disk_space
     trap trap_handler EXIT INT TERM
 

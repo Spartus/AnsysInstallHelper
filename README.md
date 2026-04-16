@@ -8,7 +8,7 @@ This project is aimed at repeatable bare-metal or VM installs where you want one
 - install missing prerequisite packages
 - prepare Ansys install media
 - run silent installs with remembered product selections
-- optionally write `ansyslmd.ini` after a successful install
+- pass license server info to the installer
 
 It currently supports these Ansys releases:
 
@@ -49,13 +49,11 @@ The script is self-contained. It embeds the prerequisite package arrays and does
   - one TGZ archive per install pass
 - Remembers product selections during the current session.
 - Allows repeated install passes, which is useful for follow-up TGZ or service-pack installs.
-- Writes `SERVER=1055@hostname` to `ansyslmd.ini` after a successful install if you configured a hostname and the file does not already exist.
+- Passes `-licserverinfo` to the installer when you configure a license hostname.
 
 ## What it does not do
 
-- It does not use `-licserverinfo`.
 - It does not support ISO + TGZ mixed media in one install pass.
-- It does not overwrite an existing `ansyslmd.ini`.
 - It does not auto-chain service packs; instead, you prepare and run a second install pass.
 
 ## Requirements
@@ -144,19 +142,15 @@ bash ansys_install_helper.sh \
 ## License behavior
 
 - Use menu option `7` to store a license server hostname.
-- After a successful install, the helper tries to write:
+- The helper passes that information to the installer with:
 
 ```text
-<install_dir>/shared_files/licensing/ansyslmd.ini
+-licserverinfo 2325:1055:hostname
 ```
 
-- The file content is:
-
-```text
-SERVER=1055@hostname
-```
-
-- If `ansyslmd.ini` already exists, the helper reports that and leaves it unchanged.
+- The helper asks only for the hostname.
+- The ports are fixed to `2325:1055` by default.
+- The helper no longer writes `ansyslmd.ini` directly.
 
 ## License Manager mode
 
@@ -183,4 +177,3 @@ Use both together when you want a license-only deployment.
 - Some network or FUSE-mounted media paths may be readable by your login user but not by `root` under `sudo`. In that case, stage the media to a local root-readable path first.
 - The helper does not guarantee every distro package name is still present in every enabled repository; when package installation fails, it reports the remaining missing packages and points you to the log.
 - Product flags that require an additional path, such as some AVxcelerate components, will prompt for that path when selected.
-
